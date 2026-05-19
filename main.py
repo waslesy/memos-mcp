@@ -134,6 +134,21 @@ def fmt(m: dict, show_state=False) -> str:
     tag = " [归档]" if archived and show_state else ""
     return f"[{uid}]{tag} {preview(m.get('content', ''))}"
 
+
+import re as _re
+
+_CODE_BLOCK = _re.compile(r"```[\s\S]*?```")
+_INLINE_CODE = _re.compile(r"`[^`]+`")
+_TAG_RE = _re.compile(r"(?:^|(?<=\s))#([a-zA-Z\u4e00-\u9fff][\w\u4e00-\u9fff\-]*)", _re.MULTILINE)
+
+def strip_code(text: str) -> str:
+    text = _CODE_BLOCK.sub("", text)
+    text = _INLINE_CODE.sub("", text)
+    return text
+
+def extract_tags(text: str) -> list[str]:
+    return [f"#{m}" for m in _TAG_RE.findall(strip_code(text))]
+
 def safe_list(filter_str=None, page_size=20, page_token=None):
     """服务端 filter 优先；400 则降级为无 filter"""
     try:
@@ -215,7 +230,7 @@ def h_search(keyword: str, include_archived: bool = False) -> str:
 def h_by_tag(tag: str) -> str:
     tag = tag.lstrip("#")
     memos = sqlite_list(False)
-    memos = [m for m in memos if f"#{tag}" in m.get("content", "")]
+    memos = [m for m in memos if f"#{tag}" in extract_tags(m.get("content", ""))]
     if not memos:
         return f"未找到 #{tag}"
     return (f"🏷️ #{tag} ({len(memos)} 条):\n"
@@ -235,10 +250,8 @@ def h_stats() -> str:
     archived = len(memos) - active
     tags = Counter()
     for m in memos:
-        for w in m.get("content", "").split():
-            w = w.rstrip(".,;:!?()[]{}\"'")
-            if w.startswith("#") and len(w) > 1:
-                tags[w] += 1
+        for t in extract_tags(m.get("content", "")):
+            tags[t] += 1
     top = " ".join(f"{t}({c})" for t, c in tags.most_common(10))
     return f"📊 活跃 {active} · 归档 {archived} · 共 {len(memos)}\n🏷️ {top or '无标签'}"
 
