@@ -1,0 +1,20 @@
+services:
+  memos-mcp:
+    build: .
+    container_name: memos-mcp
+    environment:
+      - MEMOS_HOST=http://memos:5230
+      - MEMOS_TOKEN=${MEMOS_TOKEN}
+      - PORT=8080
+      - MEMOS_DB=/data/memos.db
+    ports:
+      - "8080:8080"
+    volumes:
+      - /opt/memos/data/memos_prod.db:/data/memos.db:ro
+    restart: unless-stopped
+    networks:
+      - memos_default
+
+networks:
+  memos_default:
+    external: true

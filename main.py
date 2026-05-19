@@ -23,10 +23,10 @@ PORT        = int(os.getenv("PORT", "8080"))
 # Memos 版本适配 — 按实际版本改这三行即可
 # v0.22: rowStatus / NORMAL / ARCHIVED
 # v0.23+: rowStatus / ACTIVE / ARCHIVED
-ROW_STATUS     = "rowStatus"
+ROW_STATUS     = "state"
 ACTIVE_VALUE   = "NORMAL"
 ARCHIVED_VALUE = "ARCHIVED"
-FILTER_FIELD   = "row_status"   # filter 表达式用蛇形命名
+FILTER_FIELD   = "state"
 
 logging.basicConfig(
     stream=sys.stderr, level=logging.INFO,
@@ -82,6 +82,7 @@ class Memos:
             "pageSize": page_size,
             "pageToken": page_token,
             "filter": filter_str,
+            "creator": "users/1",
         })
         return r if isinstance(r, dict) else {"memos": r}
 
@@ -92,6 +93,26 @@ class Memos:
 
 
 api = Memos(MEMOS_HOST, MEMOS_TOKEN)
+
+# ── SQLite 直读（绕过 v0.24 ListMemos bug） ──
+MEMOS_DB = os.getenv("MEMOS_DB", "/data/memos.db")
+
+def sqlite_list(include_archived=False):
+    import sqlite3
+    conn = sqlite3.connect(MEMOS_DB)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    if include_archived:
+        c.execute('SELECT uid, content, row_status FROM memo ORDER BY created_ts DESC')
+    else:
+        c.execute('SELECT uid, content, row_status FROM memo WHERE row_status="NORMAL" ORDER BY created_ts DESC')
+    rows = c.fetchall()
+    conn.close()
+    return [{
+        "name": f"memos/{r['uid']}",
+        "content": r['content'],
+        "state": r['row_status'],
+    } for r in rows]
 
 
 # ════════════════════════════════════════════════════
@@ -118,7 +139,7 @@ def safe_list(filter_str=None, page_size=20, page_token=None):
     try:
         return api.list(page_size, page_token, filter_str)
     except RuntimeError as e:
-        if "400" in str(e) or "invalid" in str(e).lower():
+        if any(code in str(e) for code in ["400","500","13"]):
             log.warning(f"Filter rejected: {filter_str}")
             return api.list(page_size, page_token)
         raise
@@ -171,60 +192,34 @@ def h_delete(memo_id: str, hard: bool = False) -> str:
 
 def h_list(page_size: int = 20, page_token: str = None,
            include_archived: bool = False) -> str:
-    f = None if include_archived else f'{FILTER_FIELD} == "{ACTIVE_VALUE}"'
-    r = safe_list(f, page_size, page_token)
-    memos = r.get("memos", [])
+    memos = sqlite_list(include_archived)
     if not memos:
         return "暂无 Memo"
-    lines = [fmt(m, show_state=include_archived) for m in memos]
-    out = "\n".join(lines)
-    npt = r.get("nextPageToken")
-    if npt:
-        out += f"\n\n📄 下一页 token: {npt}"
-    return out
+    lines = [fmt(m, show_state=include_archived) for m in memos[:page_size]]
+    return "\n".join(lines)
 
 def h_list_archived(page_size: int = 50) -> str:
-    r = safe_list(f'{FILTER_FIELD} == "{ARCHIVED_VALUE}"', page_size)
-    memos = r.get("memos", [])
+    memos = [m for m in sqlite_list(True) if m.get("state", "NORMAL") == "ARCHIVED"]
     if not memos:
         return "无归档 Memo"
-    return "\n".join(fmt(m) for m in memos)
+    return "\n".join(fmt(m) for m in memos[:page_size])
 
 def h_search(keyword: str, include_archived: bool = False) -> str:
-    # 优先服务端
-    parts = [f'content_search == ["{keyword}"]']
-    if not include_archived:
-        parts.append(f'{FILTER_FIELD} == "{ACTIVE_VALUE}"')
-    try:
-        r = safe_list(" && ".join(parts), 50)
-        memos = r.get("memos", [])
-    except RuntimeError:
-        # 完全降级：客户端过滤
-        r = api.list(200)
-        kw = keyword.lower()
-        memos = [m for m in r.get("memos", [])
-                 if kw in m.get("content", "").lower()]
-        if not include_archived:
-            memos = [m for m in memos if state_of(m) != ARCHIVED_VALUE]
+    kw = keyword.lower()
+    memos = sqlite_list(include_archived)
+    memos = [m for m in memos if kw in m.get("content", "").lower()]
     if not memos:
         return f"未找到 '{keyword}'"
     return (f"🔍 '{keyword}' ({len(memos)} 条):\n"
             + "\n".join(fmt(m, show_state=True) for m in memos))
-
 def h_by_tag(tag: str) -> str:
     tag = tag.lstrip("#")
-    try:
-        r = safe_list(f'content_search == ["#{tag}"]', 50)
-        memos = r.get("memos", [])
-    except RuntimeError:
-        r = api.list(200)
-        memos = [m for m in r.get("memos", [])
-                 if f"#{tag}" in m.get("content", "")]
+    memos = sqlite_list(False)
+    memos = [m for m in memos if f"#{tag}" in m.get("content", "")]
     if not memos:
         return f"未找到 #{tag}"
     return (f"🏷️ #{tag} ({len(memos)} 条):\n"
             + "\n".join(fmt(m) for m in memos))
-
 def h_batch_archive(memo_ids: list) -> str:
     out = []
     for mid in memo_ids:
@@ -235,9 +230,8 @@ def h_batch_archive(memo_ids: list) -> str:
     return "\n".join(out)
 
 def h_stats() -> str:
-    r = api.list(200)
-    memos = r.get("memos", [])
-    active = sum(1 for m in memos if state_of(m) != ARCHIVED_VALUE)
+    memos = sqlite_list(True)
+    active = sum(1 for m in memos if m.get("state", "NORMAL") != "ARCHIVED")
     archived = len(memos) - active
     tags = Counter()
     for m in memos:
